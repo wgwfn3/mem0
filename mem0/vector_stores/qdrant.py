@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Optional
+from typing import Optional, Union
 
 from qdrant_client import QdrantClient, models
 from qdrant_client.models import (
@@ -262,9 +262,48 @@ class Qdrant(VectorStoreBase):
             for v in range_kwargs.values()
         )
 
-    def _build_field_condition(self, key: str, value) -> Optional[FieldCondition]:
+    @staticmethod
+    def _is_keyword_or_integer_list(values) -> bool:
+        """Whether MatchAny/MatchExcept accept ``values``: a list of only strings or only ints (not bools)."""
+        return all(isinstance(v, str) for v in values) or all(
+            isinstance(v, int) and not isinstance(v, bool) for v in values
+        )
+
+    @staticmethod
+    def _equals_condition(key: str, value) -> FieldCondition:
+        """Exact-match condition for one scalar.
+
+        MatchValue only accepts str, int and bool, so a float is matched with
+        the closed range [value, value] instead.
         """
-        Build a single FieldCondition from a key-value filter pair.
+        if isinstance(value, float):
+            return FieldCondition(key=key, range=Range(gte=value, lte=value))
+        return FieldCondition(key=key, match=MatchValue(value=value))
+
+    def _any_of_condition(self, key: str, values) -> Union[FieldCondition, Filter]:
+        """Condition matching records whose ``key`` equals any of ``values``."""
+        if not isinstance(values, list) or self._is_keyword_or_integer_list(values):
+            return FieldCondition(key=key, match=MatchAny(any=values))
+        # Floats, bools or mixed types: MatchAny rejects them, so OR the equalities.
+        return Filter(should=[self._equals_condition(key, v) for v in values])
+
+    def _none_of_condition(self, key: str, values) -> Union[FieldCondition, Filter]:
+        """Condition matching records whose ``key`` is set and equals none of ``values``."""
+        if not isinstance(values, list) or self._is_keyword_or_integer_list(values):
+            return FieldCondition(key=key, match=MatchExcept(**{"except": values}))
+        # Floats, bools or mixed types: MatchExcept rejects them. As with MatchExcept,
+        # records whose field is missing, null or [] do not match (IsEmpty exclusion).
+        # Unlike MatchExcept, an array field is excluded if it contains any listed value.
+        return Filter(
+            must_not=[
+                models.IsEmptyCondition(is_empty=models.PayloadField(key=key)),
+                *(self._equals_condition(key, v) for v in values),
+            ]
+        )
+
+    def _build_field_condition(self, key: str, value) -> Optional[Union[FieldCondition, Filter]]:
+        """
+        Build a single condition from a key-value filter pair.
 
         Supports the enhanced filter syntax documented at
         https://docs.mem0.ai/open-source/features/metadata-filtering
@@ -274,8 +313,9 @@ class Qdrant(VectorStoreBase):
             value: A scalar for simple equality, or a dict with one operator key.
 
         Returns:
-            Optional[FieldCondition]: The Qdrant field condition, or None if the
-            value is the wildcard '*' (match any / field exists — skip filter).
+            Optional[Union[FieldCondition, Filter]]: The Qdrant condition (a nested
+            Filter when float or bool values cannot be expressed as a single match),
+            or None if the value is the wildcard '*' (match any / field exists — skip filter).
         """
         if not isinstance(value, dict):
             if value == "*":
@@ -284,9 +324,9 @@ class Qdrant(VectorStoreBase):
                 return None
             if isinstance(value, list):
                 # List shorthand: {"field": ["a", "b"]} treated as in-operator.
-                return FieldCondition(key=key, match=MatchAny(any=value))
+                return self._any_of_condition(key, value)
             # Simple equality: {"field": "value"}
-            return FieldCondition(key=key, match=MatchValue(value=value))
+            return self._equals_condition(key, value)
 
         ops = set(value.keys())
         range_ops = {"gt", "gte", "lt", "lte"}
@@ -309,13 +349,13 @@ class Qdrant(VectorStoreBase):
                     ) from e
             return FieldCondition(key=key, range=Range(**range_kwargs))
         elif "eq" in value:
-            return FieldCondition(key=key, match=MatchValue(value=value["eq"]))
+            return self._equals_condition(key, value["eq"])
         elif "ne" in value:
-            return FieldCondition(key=key, match=MatchExcept(**{"except": [value["ne"]]}))
+            return self._none_of_condition(key, [value["ne"]])
         elif "in" in value:
-            return FieldCondition(key=key, match=MatchAny(any=value["in"]))
+            return self._any_of_condition(key, value["in"])
         elif "nin" in value:
-            return FieldCondition(key=key, match=MatchExcept(**{"except": value["nin"]}))
+            return self._none_of_condition(key, value["nin"])
         elif "contains" in value or "icontains" in value:
             # MatchText: with a full-text index, tokenized matching (all words must appear).
             # Without a full-text index, exact substring match.
