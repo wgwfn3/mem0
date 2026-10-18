@@ -519,11 +519,37 @@ class TestQdrantEnhancedFilters(unittest.TestCase):
         self.assertIsInstance(cond.match, MatchValue)
         self.assertEqual(cond.match.value, "programming")
 
+    def test_float_scalar_equality_uses_exact_range(self):
+        """Float equality is represented by a closed range because MatchValue rejects floats."""
+        cond = self.qdrant._build_field_condition("rating", 4.5)
+        self.assertIsInstance(cond.range, Range)
+        self.assertEqual(cond.range.gte, 4.5)
+        self.assertEqual(cond.range.lte, 4.5)
+
+    def test_float_eq_operator_uses_exact_range(self):
+        cond = self.qdrant._build_field_condition("rating", {"eq": 4.5})
+        self.assertIsInstance(cond.range, Range)
+        self.assertEqual(cond.range.gte, 4.5)
+        self.assertEqual(cond.range.lte, 4.5)
+
     def test_ne_operator(self):
         """{\"ne\": v} maps to MatchExcept with a single-element list."""
         cond = self.qdrant._build_field_condition("category", {"ne": "spam"})
         self.assertIsInstance(cond.match, MatchExcept)
         self.assertIn("spam", getattr(cond.match, "except_", None) or getattr(cond.match, "except"))
+
+    def test_float_ne_operator_uses_nested_exclusion(self):
+        cond = self.qdrant._build_field_condition("rating", {"ne": 4.5})
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual(len(cond.must_not), 2)
+        self.assertEqual(cond.must_not[1].range.gte, 4.5)
+        self.assertEqual(cond.must_not[1].range.lte, 4.5)
+
+    def test_boolean_ne_operator_uses_nested_exclusion(self):
+        cond = self.qdrant._build_field_condition("archived", {"ne": True})
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual(len(cond.must_not), 2)
+        self.assertEqual(cond.must_not[1].match.value, True)
 
     def test_in_operator(self):
         """{\"in\": [...]} maps to MatchAny."""
@@ -538,6 +564,32 @@ class TestQdrantEnhancedFilters(unittest.TestCase):
         excluded = getattr(cond.match, "except_", None) or getattr(cond.match, "except")
         self.assertIn("deleted", excluded)
         self.assertIn("banned", excluded)
+
+    def test_integer_in_operator_keeps_match_any(self):
+        cond = self.qdrant._build_field_condition("priority", {"in": [1, 2]})
+        self.assertIsInstance(cond.match, MatchAny)
+        self.assertEqual(cond.match.any, [1, 2])
+
+    def test_float_in_operator_uses_nested_should(self):
+        cond = self.qdrant._build_field_condition("rating", {"in": [4.5, 3.0]})
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual([c.range.gte for c in cond.should], [4.5, 3.0])
+
+    def test_boolean_in_operator_uses_nested_should(self):
+        cond = self.qdrant._build_field_condition("archived", {"in": [True]})
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual(cond.should[0].match.value, True)
+
+    def test_mixed_list_shorthand_uses_nested_should(self):
+        cond = self.qdrant._build_field_condition("rating", [4.5, 2])
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual(cond.should[0].range.gte, 4.5)
+        self.assertEqual(cond.should[1].match.value, 2)
+
+    def test_float_nin_operator_uses_nested_exclusion(self):
+        cond = self.qdrant._build_field_condition("rating", {"nin": [4.5]})
+        self.assertIsInstance(cond, Filter)
+        self.assertEqual(cond.must_not[1].range.gte, 4.5)
 
     def test_contains_operator(self):
         """{\"contains\": x} maps to MatchText."""
@@ -941,6 +993,42 @@ class TestQdrantEnhancedFilters(unittest.TestCase):
         self.assertIsNotNone(result.must_not)
         # Deduplicated: NOT wins, $not is skipped — exactly 1 entry
         self.assertEqual(len(result.must_not), 1)
+
+
+class TestQdrantFloatAndBoolFiltersLocal(unittest.TestCase):
+    """Float/bool metadata filters against an in-memory Qdrant (MatchValue/MatchAny reject them)."""
+
+    def setUp(self):
+        self.qdrant = Qdrant(collection_name="float_bool", embedding_model_dims=2, client=QdrantClient(":memory:"))
+        self.qdrant.insert(
+            vectors=[[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]],
+            payloads=[
+                {"user_id": "a", "name": "hotel", "rating": 4.5, "archived": True},
+                {"user_id": "a", "name": "cafe", "rating": 3.0, "archived": False},
+                {"user_id": "a", "name": "bar", "rating": 2},
+                {"user_id": "b", "name": "other", "rating": 4.5, "archived": True},
+            ],
+            ids=[str(uuid.uuid4()) for _ in range(4)],
+        )
+
+    def _names(self, extra):
+        results = self.qdrant.list(filters={"user_id": "a", **extra}, top_k=10)[0]
+        return sorted(r.payload["name"] for r in results)
+
+    def test_float_filters(self):
+        self.assertEqual(self._names({"rating": 4.5}), ["hotel"])
+        self.assertEqual(self._names({"rating": {"eq": 4.5}}), ["hotel"])
+        self.assertEqual(self._names({"rating": {"ne": 4.5}}), ["bar", "cafe"])
+        self.assertEqual(self._names({"rating": {"in": [4.5, 3.0]}}), ["cafe", "hotel"])
+        self.assertEqual(self._names({"rating": {"nin": [4.5]}}), ["bar", "cafe"])
+        self.assertEqual(self._names({"rating": [4.5, 2]}), ["bar", "hotel"])
+
+    def test_bool_filters(self):
+        self.assertEqual(self._names({"archived": True}), ["hotel"])
+        # Like MatchExcept, records without the field are not matched by ne/nin.
+        self.assertEqual(self._names({"archived": {"ne": True}}), ["cafe"])
+        self.assertEqual(self._names({"archived": {"in": [True]}}), ["hotel"])
+        self.assertEqual(self._names({"archived": {"nin": [True]}}), ["cafe"])
 
 
 class TestQdrantDatetimeRangeFilters(unittest.TestCase):
